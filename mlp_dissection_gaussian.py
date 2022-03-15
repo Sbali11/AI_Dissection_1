@@ -25,11 +25,6 @@ import torchmetrics.functional as FM
 alpha = float(sys.argv[1])
 beta = float(sys.argv[2])
 gamma = float(sys.argv[3])
-
-# 0 for expected, 1 for emperical
-loss_type = int(sys.argv[4])
-
-
 # Calculate human confidence
 confidence = alpha - gamma / (1 + beta)
 
@@ -59,35 +54,31 @@ class CustomDataset(Dataset):
         self.input = torch.tensor(data[0])
         self.targets = torch.tensor(data[1])
         self.is_rational = torch.tensor(data[2])
-        self.human_effort = torch.tensor(data[3])
+        self.g_confidence = torch.tensor(data[3])
 
         self.eye = torch.eye(classes)
         self.human_rationality = human_rationality
-        
 
     def __getitem__(self, index):
         x = self.input[index].float()
         y = self.targets[index].float()
         # assumes fixed irrationality
         is_rational = self.is_rational[index].float()
-        human_effort = self.human_effort[index].float()
-        return x, y, is_rational, human_effort
+        g_confidence = self.g_confidence[index].float()
+        # assumes the rational point 
+        return x, y, is_rational, g_confidence
 
     def __len__(self):
         return len(self.input)
 
 
-def load_datasets(X, Y, human_rationality=1):
-
+def load_datasets(X, Y, human_rationality=1, std=0.1):
+    
     size = np.array(X).shape[0]
+    g_confidence = torch.normal(mean=torch.ones(size) * confidence, std=torch.ones(size) * std)
     permute = np.random.permutation(size)
     a = torch.empty(size).uniform_(0, 1)
     is_rational = torch.ones(size) * (a < human_rationality)
-
-    human_correctness = torch.empty(size).uniform_(0, 1)
-    human_effort = ((1 - gamma) * torch.ones(size) * (human_correctness <= alpha)) + (
-        (-beta - gamma) * torch.ones(size) * (human_correctness > alpha)
-    )
 
     X_p = X[permute]
     Y_p = Y[permute]
@@ -96,53 +87,55 @@ def load_datasets(X, Y, human_rationality=1):
     train_size = int(size * DATA_SPLIT["train"])
     val_size = int(size * DATA_SPLIT["val"])
 
-    train = (
-        X_p[:train_size],
-        Y_p[:train_size],
-        is_rational_p[:train_size],
-        human_effort[:train_size],
-    )
+    train = X_p[:train_size], Y_p[:train_size], is_rational_p[:train_size], g_confidence[:train_size]
     val = (
         X_p[train_size : train_size + val_size],
         Y_p[train_size : train_size + val_size],
         is_rational_p[train_size : train_size + val_size],
-        human_effort[train_size : train_size + val_size],
+        g_confidence[train_size : train_size + val_size]
     )
     test = (
         X_p[train_size + val_size :],
         Y_p[train_size + val_size :],
         is_rational_p[train_size + val_size :],
-        human_effort[train_size + val_size :],
+        g_confidence[train_size : train_size + val_size]
     )
     return train, val, test
 
 
-def emperical_team_utility_loss(pred, y, is_rational, human_effort):
-    human_effort = human_effort.view(-1, 1)
-    is_rational = is_rational.view(-1, 1)
+# Function to calculate the team expected utility
+def expected_team_utility_g_loss(pred, y, is_rational, g_confidence):
+    g_confidence = g_confidence.view(-1, 1)
+    pos_pos_mask = torch.relu(pred - g_confidence) / (pred - g_confidence)
+    neg_pos_mask = torch.relu(-pred + g_confidence) / (-pred + g_confidence)
 
-    pos_pos_mask = torch.relu(pred - confidence) / (pred - confidence)
-    neg_pos_mask = torch.relu(-pred + confidence) / (-pred + confidence)
-
-    pred_pos = torch.relu(pred - 0.5) / (pred - 0.5)
-    pred_neg = torch.relu(-pred + 0.5) / (-pred + 0.5)
-
-    pos_y = y * (pred_pos - beta * pred_neg)
-    neg_y = (1 - y) * (pred_neg - beta * pred_pos)
-
-    irrational = (
-        human_effort
-        * (1 - is_rational)
+    pos_y = y * (
+        ((1 + beta) * pred - beta) * pos_pos_mask
+        + ((1 + beta) * alpha - beta - gamma) * (neg_pos_mask)
     )
+
+    npred = 1 - pred
+    pos_neg_mask = torch.relu(npred - g_confidence) / (npred - g_confidence)
+    neg_neg_mask = torch.relu(-npred + g_confidence) / (-npred + g_confidence)
+
+    neg_y = (1 - y) * (
+        ((1 + beta) * npred - beta) * (pos_neg_mask)
+        + ((1 + beta) * alpha - beta - gamma) * (neg_neg_mask)
+    )
+    is_rational = is_rational.view(-1, 1)
+    irrational = torch.ones((len(pred), 1)) * (1 - is_rational) *  ((1 + beta) * alpha - beta - gamma)
     rational = ((pos_y + neg_y)) * (is_rational)
-    #print((neg_pos_mask * human_effort).shape)
-    #print((pos_pos_mask * (pos_y + neg_y)).shape)
-    return torch.sum(neg_pos_mask * human_effort + pos_pos_mask * (rational + irrational))/len(pred)
+    #assert (torch.max(is_rational) <= 1)
+    #assert (torch.max(pos_y + neg_y) <= 1)
+    #assert (torch.max(rational + irrational) <= 1)
+    #assert len(rational + irrational) == len(pred)
+    return -torch.sum(rational + irrational)/len(pred)
+
 
 
 # Function to calculate the team expected utility
-def expected_team_utility_loss(pred, y, is_rational, human_effort):
-    # print(list(is_rational))
+def expected_team_utility_loss(pred, y, is_rational):
+    #print(list(is_rational))
 
     pos_pos_mask = torch.relu(pred - confidence) / (pred - confidence)
     neg_pos_mask = torch.relu(-pred + confidence) / (-pred + confidence)
@@ -161,17 +154,13 @@ def expected_team_utility_loss(pred, y, is_rational, human_effort):
         + ((1 + beta) * alpha - beta - gamma) * (neg_neg_mask)
     )
     is_rational = is_rational.view(-1, 1)
-    irrational = (
-        torch.ones((len(pred), 1))
-        * (1 - is_rational)
-        * ((1 + beta) * alpha - beta - gamma)
-    )
+    irrational = torch.ones((len(pred), 1)) * (1 - is_rational) *  ((1 + beta) * alpha - beta - gamma)
     rational = ((pos_y + neg_y)) * (is_rational)
-    assert torch.max(is_rational) <= 1
-    assert torch.max(pos_y + neg_y) <= 1
-    assert torch.max(rational + irrational) <= 1
+    assert (torch.max(is_rational) <= 1)
+    assert (torch.max(pos_y + neg_y) <= 1)
+    assert (torch.max(rational + irrational) <= 1)
     assert len(rational + irrational) == len(pred)
-    return -torch.sum(rational + irrational) / len(pred)
+    return -torch.sum(rational + irrational)/len(pred)
 
 
 class FeedForward(torch.nn.Module):
@@ -206,16 +195,15 @@ class PLModel(LightningModule):
         layer2_size,
         train_type="initial",
         human_rationality=1,
+        std=0.1
     ):
         super().__init__()
         self.train_type = train_type
 
         if train_type == "initial":
             self.loss = torch.nn.BCELoss()
-        elif loss_type == 0:
-            self.loss = expected_team_utility_loss
         else:
-            self.loss = emperical_team_utility_loss
+            self.loss = expected_team_utility_loss
 
         self.input_size = input_size
         self.layer1_size = layer1_size
@@ -225,9 +213,8 @@ class PLModel(LightningModule):
         )
 
         self.train_set, self.val_set, self.test_set = load_datasets(
-            X, Y, human_rationality=human_rationality
+            X, Y, human_rationality=human_rationality, std=std
         )
-
 
     def load_model(self, path):
         path_dict = torch.load(path)["state_dict"]
@@ -249,37 +236,33 @@ class PLModel(LightningModule):
         return DataLoader(CustomDataset(self.test_set), batch_size=64)
 
     def test_step(self, batch, batch_idx):
-        
-        x, y, is_rational, human_effort = batch
+        x, y, is_rational, g_confidence = batch
         y = y.view(-1, 1)
         predicted = self(x)
         if self.train_type == "initial":
             loss = self.loss(predicted, y)
         else:
-            loss = self.loss(predicted, y, is_rational, human_effort)
+            loss = self.loss(predicted, y, is_rational)
         self.log("test_loss", loss)
 
     def validation_step(self, batch, batch_idx):
-        x, y, is_rational, human_effort = batch
+        x, y, is_rational, g_confidence = batch
         y = y.view(-1, 1)
         predicted = self(x)
         if self.train_type == "initial":
             loss = self.loss(predicted, y)
         else:
-            loss = self.loss(predicted, y, is_rational, human_effort)
+            loss = self.loss(predicted, y, is_rational)
 
         self.log("val_loss", loss)
-        if loss_type == 0:
-            utility = expected_team_utility_loss(predicted, y, is_rational, human_effort)
-        else:
-            utility = emperical_team_utility_loss(predicted, y, is_rational, human_effort)
-        # print(utility)
+        utility = expected_team_utility_g_loss(predicted, y, is_rational, g_confidence)
+        #print(utility)
         self.log("val_utility", utility)
         return {
             "val_loss": loss,
             "val_y": y,
             "val_y_hat": predicted,
-            "is_rational": is_rational,
+            "is_rational": is_rational
         }
 
     def validation_epoch_end(self, out):
@@ -289,17 +272,18 @@ class PLModel(LightningModule):
         val_loss = torch.tensor([out[i]["val_loss"] for i in range(len(out))])
         accuracy = FM.accuracy(y_hat, y.int())
 
+
         self.log("ep_val_loss", torch.mean(val_loss))
         self.log("val_acc", accuracy)
 
     def training_step(self, batch, batch_idx):
-        x, y, is_rational, human_effort = batch
+        x, y, is_rational, g_confidence = batch
         y = y.view(-1, 1)
         predicted = self(x)
         if self.train_type == "initial":
             loss = self.loss(predicted, y)
         else:
-            loss = self.loss(predicted, y, is_rational, human_effort)
+            loss = self.loss(predicted, y, is_rational)
         return loss
 
     def forward(self, x):
@@ -312,28 +296,29 @@ sc_X = StandardScaler()
 # X_valscaled = sc_X.transform(X_test)
 
 
+
+
 # print(model.state_dict())
 def train_experiment_models():
-    for r in RATIONALITY:
+    for std in [1e-3, 1e-2, 1e-1, 0.2, 0.5]:
         seed_everything(42)
-
         checkpoint_callback = pl.callbacks.model_checkpoint.ModelCheckpoint(
             monitor="val_loss",
-            dirpath=f"models_saved/experiments/moon/{loss_type}/r-{r}/og",
+            dirpath=f"models_saved/experiments_gaussian/s-{std}/og",
             filename="sst-{epoch:02d}-{val_utility:.2f}-{ep_val_loss:.2f}-{val_acc:.2f}",
             mode="min",
         )
-        model = PLModel(X, y, 2, 50, 10, human_rationality=r)
+        model = PLModel(X, y, 2, 50, 10, human_rationality=1, std=std)
         trainer = Trainer(max_epochs=100, callbacks=[checkpoint_callback])
         trainer.fit(model)
         checkpt = checkpoint_callback.best_model_path
         print(checkpoint_callback.best_model_path)
-        model = PLModel(X, y, 2, 50, 10, train_type="experiment", human_rationality=r)
+        model = PLModel(X, y, 2, 50, 10, train_type="experiment", human_rationality=1, std=std)
         model.load_model(checkpt)
         checkpoint_callback_1 = pl.callbacks.model_checkpoint.ModelCheckpoint(
             monitor="val_loss",
-            dirpath=f"models_saved/experiments/moon/{loss_type}/r-{r}/experiment",
-            filename="sst-{epoch:02d}-{val_utility:.3f}-{ep_val_loss:.3f}-{val_acc:.3f}",
+            dirpath=f"models_saved/experiments_gaussian/s-{std}/exp",
+            filename="sst-{epoch:02d}-{val_utility:.2f}-{ep_val_loss:.2f}-{val_acc:.2f}",
             mode="min",
         )
         trainer = Trainer(max_epochs=100, callbacks=[checkpoint_callback_1])
