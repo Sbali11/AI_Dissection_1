@@ -31,7 +31,11 @@ confidence = alpha - gamma / (1 + beta)
 rng = np.random.default_rng()
 
 # Create make_moons dataset and split training and test data setts
-X, y = make_moons(n_samples=10000, noise=0.1, random_state=1)
+def get_Xy(dtype="moons"):
+    if dtype=="moons":
+        return make_moons(n_samples=10000, noise=0.3, random_state=1)
+
+X, y = get_Xy()
 df = pd.DataFrame(dict(x=X[:, 0], y=X[:, 1], label=y))
 target = df.label
 df.drop(["label"], axis=1, inplace=True)
@@ -97,7 +101,7 @@ def expected_team_utility_loss(pred, y):
     )
 
     #print(-torch.sum((pos_y + neg_y)), pred, y)
-    return -torch.sum((pos_y + neg_y))
+    return -torch.sum((pos_y + neg_y))/len(pred)
 
 class FeedForward(torch.nn.Module):
     def __init__(self, input_size, layer1_size, layer2_size):
@@ -148,7 +152,7 @@ class PLModel(LightningModule):
         print('Model Created!')
 
     def configure_optimizers(self):
-        return torch.optim.SGD(model.parameters(), lr=0.01)
+        return torch.optim.SGD(model.parameters(), lr=0.1)
 
     def train_dataloader(self):
         return DataLoader(CustomDataset(self.train_set), batch_size=64)
@@ -174,10 +178,11 @@ class PLModel(LightningModule):
         loss = self.loss(predicted, y)
 
         self.log("val_loss", loss)
+        self.log("val_utility",  expected_team_utility_loss(predicted, y))
         return {
             "val_loss": loss,
             "val_y": y,
-            "val_y_hat": predicted
+            "val_y_hat": predicted,
         }
     def validation_epoch_end(self, out):
         y_hat = torch.cat([out[i]["val_y_hat"] for i in range(len(out))])
@@ -210,11 +215,11 @@ seed_everything(42)
 checkpoint_callback = pl.callbacks.model_checkpoint.ModelCheckpoint(
     monitor="val_loss",
     dirpath="models_saved",
-    filename="sst-{epoch:02d}-{val_loss:.2f}-{val_acc:.2f}",
+    filename="sst-{epoch:02d}-{val_utility:.2f}-{val_loss:.2f}-{val_acc:.2f}",
     mode="min",
 )
 model = PLModel(X, y, 2, 50, 10)
-trainer = Trainer(max_epochs=1, callbacks=[checkpoint_callback])
+trainer = Trainer(max_epochs=100, callbacks=[checkpoint_callback])
 trainer.fit(model)
 print(checkpoint_callback.best_model_path)
 
@@ -228,7 +233,7 @@ model.load_model(
 checkpoint_callback_1 = pl.callbacks.model_checkpoint.ModelCheckpoint(
     monitor="val_loss",
     dirpath="models_saved",
-    filename="sst2-{epoch:02d}-{val_loss:.2f}-{val_acc:.2f}",
+    filename="sst2-{epoch:02d}-{val_utility:.2f}-{val_loss:.2f}-{val_acc:.2f}",
     mode="min",
 )
 
