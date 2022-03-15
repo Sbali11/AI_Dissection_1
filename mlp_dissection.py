@@ -18,6 +18,7 @@ import numpy as np
 from torch.optim import Adam
 from pytorch_lightning import Trainer, seed_everything
 import pytorch_lightning as pl
+import torchmetrics.functional as FM
 
 # Take in alpha beta and gamma as inputs
 alpha = float(sys.argv[1])
@@ -173,6 +174,18 @@ class PLModel(LightningModule):
         loss = self.loss(predicted, y)
 
         self.log("val_loss", loss)
+        return {
+            "val_loss": loss,
+            "val_y": y,
+            "val_y_hat": predicted
+        }
+    def validation_epoch_end(self, out):
+        y_hat = torch.cat([out[i]["val_y_hat"] for i in range(len(out))])
+        y = torch.cat([out[i]["val_y"] for i in range(len(out))])
+        
+        accuracy = FM.accuracy(y_hat, y.int())
+
+        self.log("val_acc", accuracy)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -197,11 +210,11 @@ seed_everything(42)
 checkpoint_callback = pl.callbacks.model_checkpoint.ModelCheckpoint(
     monitor="val_loss",
     dirpath="models_saved",
-    filename="sst-{epoch:02d}-{val_loss:.2f}",
+    filename="sst-{epoch:02d}-{val_loss:.2f}-{val_acc:.2f}",
     mode="min",
 )
 model = PLModel(X, y, 2, 50, 10)
-trainer = Trainer(max_epochs=50, callbacks=[checkpoint_callback])
+trainer = Trainer(max_epochs=1, callbacks=[checkpoint_callback])
 trainer.fit(model)
 print(checkpoint_callback.best_model_path)
 
@@ -215,7 +228,7 @@ model.load_model(
 checkpoint_callback_1 = pl.callbacks.model_checkpoint.ModelCheckpoint(
     monitor="val_loss",
     dirpath="models_saved",
-    filename="sst2-{epoch:02d}-{val_loss:.2f}",
+    filename="sst2-{epoch:02d}-{val_loss:.2f}-{val_acc:.2f}",
     mode="min",
 )
 
